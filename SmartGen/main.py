@@ -66,7 +66,7 @@ def LLM_call(openai_client, prompt):
     ]
 
     response = openai_client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model="llama-3.3-70b-versatile",
         stream=False,
         messages=messages,
         max_tokens=8040,
@@ -195,8 +195,8 @@ if __name__ == "__main__":
             action_transition = json.load(f)
 
         openai_client = OpenAI(
-            api_key=os.getenv("gemini_API"),
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=os.getenv("Grok_API"),
+            base_url="https://api.groq.com/openai/v1",
         )
 
         for day in all_categories:

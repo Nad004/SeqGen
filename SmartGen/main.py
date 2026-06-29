@@ -25,8 +25,28 @@ vocab_dic = {"an": 141, "fr": 223, "us": 269, "sp": 235}
 device_dic = {"us": us_devices_dict, "fr": fr_devices_dict, "sp": sp_devices_dict}
 act_dic = {"us": us_actions, "fr": fr_actions, "sp": sp_actions}
 
-BATCH_SIZE = 90      # ~1728 total seqs / 20 daily quota = 86.4 → rounded up to 90 to stay within limit
-BATCH_DELAY = 60   
+BATCH_SIZE = 35  # 1728 total seqs / (7 keys x 20 req) = 12.3; 90 keeps each batch a reasonable size
+BATCH_DELAY = 5   # short pause between successful batches (seconds)
+
+API_KEYS = [k for k in [
+    os.getenv("Grok_API2"),
+    os.getenv("Grok_API3"),
+    os.getenv("Grok_API4"),
+    os.getenv("Grok_API5"),
+    os.getenv("Grok_API6"),
+    os.getenv(Grok_API7"),
+    os.getenv("Grok_API8"),
+] if k]  # silently skip any unset keys
+
+current_key_index = 0  # global pointer; rotated automatically on every 429 error
+
+
+def get_client(key_index):
+    """Create an OpenAI-compatible Gemini client for the given key index."""
+    return OpenAI(
+        api_key=API_KEYS[key_index],
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
 
 
 def get_args_parser():
@@ -52,35 +72,43 @@ def get_args_parser():
     return parser
 
 
-def LLM_call(openai_client, prompt):
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ]
-        }
-    ]
+def LLM_call(prompt):
+    """
+    Call the LLM with automatic key rotation on 429 errors.
+    Tries every available key before giving up.
+    """
+    global current_key_index
 
-    response = openai_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        stream=False,
-        messages=messages,
-        max_tokens=8040,
-        temperature=0,
-        top_p=0,
-    )
+    for attempt in range(len(API_KEYS)):
+        try:
+            client = get_client(current_key_index)
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            response = client.chat.completions.create(
+                model="gemini-2.5-flash",
+                stream=False,
+                messages=messages,
+                max_tokens=8040,
+                temperature=0,
+                top_p=0,
+            )
+            result = response.choices[0].message.content.strip()
+            print(result)
+            return result
 
-    response = response.choices[0].message.content.strip()
-    print(response)
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "quota" in str(e).lower():
+                print(f"  [Key {current_key_index + 1}/{len(API_KEYS)}] Quota exhausted. Rotating to next key...")
+                current_key_index = (current_key_index + 1) % len(API_KEYS)
+                if attempt < len(API_KEYS) - 1:
+                    time.sleep(3)  # brief pause before retrying with new key
+                    continue
+            raise  # re-raise non-quota errors immediately
 
-    return response
+    raise RuntimeError("All API keys exhausted their daily quota. Try again tomorrow.")
 
 
 def build_prompt(sentence, device_control_dict, action_transition, batch):
+    """Build the LLM prompt for a single batch of sequences."""
     return (
         "You're an IoT expert. And you are very knowledgeable about user behavior and habits in smart homes. "
         "Now, the user would like to ask you about the possible changes in user behavior sequence after the change of environment. "
@@ -123,21 +151,22 @@ def merge_sequences(all_sequences):
     return f"<seq {all_sequences} seq>"
 
 
-def call_llm_in_batches(openai_client, user_sequence, sentence, device_control_dict, action_transition):
+def call_llm_in_batches(user_sequence, sentence, device_control_dict, action_transition):
     """
-    Split user_sequence into BATCH_SIZE chunks, call the LLM for each,
-    parse the results, and return one merged <seq [...] seq> string.
+    Split user_sequence into BATCH_SIZE chunks, call the LLM for each (with
+    automatic key rotation on quota errors), parse results, and return one
+    merged <seq [...] seq> string.
     """
     merged = []
+    total_batches = (len(user_sequence) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_start in range(0, len(user_sequence), BATCH_SIZE):
         batch = user_sequence[batch_start: batch_start + BATCH_SIZE]
         batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (len(user_sequence) + BATCH_SIZE - 1) // BATCH_SIZE
-        print(f"  [Batch {batch_num}/{total_batches}] sequences {batch_start}–{batch_start + len(batch) - 1}")
+        print(f"  [Batch {batch_num}/{total_batches}] sequences {batch_start}–{batch_start + len(batch) - 1} | using key {current_key_index + 1}/{len(API_KEYS)}")
 
         prompt = build_prompt(sentence, device_control_dict, action_transition, batch)
-        response = LLM_call(openai_client, prompt)
+        response = LLM_call(prompt)
 
         parsed = extract_sequences_from_response(response)
         if parsed:
@@ -145,9 +174,7 @@ def call_llm_in_batches(openai_client, user_sequence, sentence, device_control_d
         else:
             print(f"  [Batch {batch_num}] No valid sequences extracted; skipping.")
 
-        # Respect rate limits between batches (skip delay after the last batch)
         if batch_start + BATCH_SIZE < len(user_sequence):
-            print(f"  Waiting 60 minutes before next batch...")
             time.sleep(BATCH_DELAY)
 
     return merge_sequences(merged)
@@ -157,6 +184,10 @@ if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
     print(args)
+
+    if not API_KEYS:
+        raise RuntimeError("No API keys found. Set gemini_API_1 ... gemini_API_7 in your .env file.")
+    print(f"Loaded {len(API_KEYS)} API key(s).")
 
     if args.need_generate:
         Split(args.dataset, args.ori_env, 1)
@@ -194,11 +225,6 @@ if __name__ == "__main__":
         with open(f'IoT_data/{args.dataset}/{args.ori_env}/action_transitions.json', 'r', encoding='utf-8') as f:
             action_transition = json.load(f)
 
-        openai_client = OpenAI(
-            api_key=os.getenv("Grok_API"),
-            base_url="https://api.groq.com/openai/v1",
-        )
-
         for day in all_categories:
             print(f"\n=== Processing day category: {day} ===")
             with open(
@@ -208,9 +234,8 @@ if __name__ == "__main__":
                 user_sequence = pickle.load(file3)
                 print(f"Total sequences for day {day}: {len(user_sequence)}")
 
-            # Send sequences in small batches and merge results
             combined_response = call_llm_in_batches(
-                openai_client, user_sequence, sentence, device_control_dict, action_transition
+                user_sequence, sentence, device_control_dict, action_transition
             )
 
             out_path = (
@@ -228,4 +253,4 @@ if __name__ == "__main__":
     if args.need_test:
         Anomaly_detection(args.dataset, args.new_env, args.threshold, args.method, args.model, args.percentage)
         # SASRec_behavior_prediction(args.dataset, args.new_env, args.threshold, args.method, args.model, need='train')
-        # SASRec_behavior_prediction(args.dataset, args.new_env, args.threshold, args.method, args.model, need='test')v
+        # SASRec_behavior_prediction(args.dataset, args.new_env, args.threshold, args.method, args.model, need='test')

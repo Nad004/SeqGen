@@ -3,7 +3,6 @@ import pickle
 import ast
 import os
 import json
-import time
 from openai import OpenAI
 from dictionary import dayofweek_dict, hour_dict, fr_devices_dict, fr_actions, sp_devices_dict, sp_actions, us_devices_dict, us_actions
 from split import Split
@@ -19,40 +18,20 @@ from find_categories import Find_categories
 from security_check import security_check
 from dotenv import load_dotenv
 load_dotenv()
-#from SAS_main import SASRec_behavior_prediction
 
 vocab_dic = {"an": 141, "fr": 223, "us": 269, "sp": 235}
 device_dic = {"us": us_devices_dict, "fr": fr_devices_dict, "sp": sp_devices_dict}
 act_dic = {"us": us_actions, "fr": fr_actions, "sp": sp_actions}
 
-BATCH_SIZE = 35  # 1728 total seqs / (7 keys x 20 req) = 12.3; 90 keeps each batch a reasonable size
-BATCH_DELAY = 5   # short pause between successful batches (seconds)
+MODEL = "gpt-5.5"
 
-API_KEYS = [k for k in [
-    os.getenv("Grok_API2"),
-    os.getenv("Grok_API3"),
-    os.getenv("Grok_API4"),
-    os.getenv("Grok_API5"),
-    os.getenv("Grok_API6"),
-    os.getenv("Grok_API7"),
-    os.getenv("Grok_API8"),
-] if k]  # silently skip any unset keys
-
-current_key_index = 0  # global pointer; rotated automatically on every 429 error
-
-
-def get_client(key_index):
-    """Create an OpenAI-compatible Gemini client for the given key index."""
-    return OpenAI(
-        api_key=API_KEYS[key_index],
-        base_url="https://api.groq.com/openai/v1",
-    )
+client = OpenAI(api_key=os.getenv("API_KEY"))
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('LLM generation', add_help=False)
-    parser.add_argument('--model', default='gpt-4o', type=str,
-                        help='The used LLM: Llama_405B/70B/gpt-4o/deepseek-v3')
+    parser.add_argument('--model', default=MODEL, type=str,
+                        help='The used LLM')
     parser.add_argument('--dataset', default='fr', type=str,
                         help='Name of dataset to train: an/fr/us/sp')
     parser.add_argument('--ori_env', default='winter', type=str,
@@ -73,42 +52,21 @@ def get_args_parser():
 
 
 def LLM_call(prompt):
-    """
-    Call the LLM with automatic key rotation on 429 errors.
-    Tries every available key before giving up.
-    """
-    global current_key_index
-
-    for attempt in range(len(API_KEYS)):
-        try:
-            client = get_client(current_key_index)
-            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-            response = client.chat.completions.create(
-                model="gemini-2.5-flash",
-                stream=False,
-                messages=messages,
-                max_tokens=8040,
-                temperature=0,
-                top_p=0,
-            )
-            result = response.choices[0].message.content.strip()
-            print(result)
-            return result
-
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "quota" in str(e).lower():
-                print(f"  [Key {current_key_index + 1}/{len(API_KEYS)}] Quota exhausted. Rotating to next key...")
-                current_key_index = (current_key_index + 1) % len(API_KEYS)
-                if attempt < len(API_KEYS) - 1:
-                    time.sleep(3)  # brief pause before retrying with new key
-                    continue
-            raise  # re-raise non-quota errors immediately
-
-    raise RuntimeError("All API keys exhausted their daily quota. Try again tomorrow.")
+    """Call the LLM using a single OpenAI API key."""
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=8040,
+        temperature=0,
+        top_p=1,
+    )
+    result = response.choices[0].message.content.strip()
+    print(result)
+    return result
 
 
-def build_prompt(sentence, device_control_dict, action_transition, batch):
-    """Build the LLM prompt for a single batch of sequences."""
+def build_prompt(sentence, device_control_dict, action_transition, user_sequence):
+    """Build the LLM prompt for the full sequence."""
     return (
         "You're an IoT expert. And you are very knowledgeable about user behavior and habits in smart homes. "
         "Now, the user would like to ask you about the possible changes in user behavior sequence after the change of environment. "
@@ -116,7 +74,7 @@ def build_prompt(sentence, device_control_dict, action_transition, batch):
         "And the user hope that you can use your knowledge and the set to generate possible user behavior sequences after the change based on the original sequences."
         "Each user behavior sequence consists of some quadruples containing the number of weeks, hours, devices."
         f"The set of the possible device and device states: {device_control_dict}"
-        f"{sentence} The user's compressed original sequences of behavior: {batch}. User's behavior habits: {action_transition}"
+        f"{sentence} The user's compressed original sequences of behavior: {user_sequence}. User's behavior habits: {action_transition}"
         "Your task: First, select the possible new device states from the set of devices and device states which are also possible new user behaviors. "
         "The second step is to reasonably add possible new user behaviors to the original user behavior sequences. The third step is to reasonably continue and expand the sequence based on user behavior habits."
         "Requirements:"
@@ -132,10 +90,7 @@ def build_prompt(sentence, device_control_dict, action_transition, batch):
 
 
 def extract_sequences_from_response(response):
-    """
-    Parse the <seq [...] seq> block out of an LLM response.
-    Returns a Python list of subsequences, or [] on failure.
-    """
+    """Parse the <seq [...] seq> block out of an LLM response."""
     try:
         start = response.index("<seq") + len("<seq")
         end = response.index("seq>", start)
@@ -146,52 +101,17 @@ def extract_sequences_from_response(response):
         return []
 
 
-def merge_sequences(all_sequences):
-    """Wrap a flat list of subsequences back into the <seq [...] seq> string format."""
-    return f"<seq {all_sequences} seq>"
-
-
-def call_llm_in_batches(user_sequence, sentence, device_control_dict, action_transition):
-    """
-    Split user_sequence into BATCH_SIZE chunks, call the LLM for each (with
-    automatic key rotation on quota errors), parse results, and return one
-    merged <seq [...] seq> string.
-    """
-    merged = []
-    total_batches = (len(user_sequence) + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for batch_start in range(0, len(user_sequence), BATCH_SIZE):
-        batch = user_sequence[batch_start: batch_start + BATCH_SIZE]
-        batch_num = batch_start // BATCH_SIZE + 1
-        print(f"  [Batch {batch_num}/{total_batches}] sequences {batch_start}–{batch_start + len(batch) - 1} | using key {current_key_index + 1}/{len(API_KEYS)}")
-
-        prompt = build_prompt(sentence, device_control_dict, action_transition, batch)
-        response = LLM_call(prompt)
-
-        parsed = extract_sequences_from_response(response)
-        if parsed:
-            merged.extend(parsed)
-        else:
-            print(f"  [Batch {batch_num}] No valid sequences extracted; skipping.")
-
-        if batch_start + BATCH_SIZE < len(user_sequence):
-            time.sleep(BATCH_DELAY)
-
-    return merge_sequences(merged)
-
-
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
     print(args)
 
-    if not API_KEYS:
-        raise RuntimeError("No API keys found. Set gemini_API_1 ... gemini_API_7 in your .env file.")
-    print(f"Loaded {len(API_KEYS)} API key(s).")
+    if not os.getenv("API_KEY"):
+        raise RuntimeError("No API key found. Set API_KEY in your .env file.")
 
     if args.need_generate:
         Split(args.dataset, args.ori_env, 1)
-        Dayse(args.dataset, args.ori_env)/
+        Dayse(args.dataset, args.ori_env)
         if args.method == 'SPPC':
             Train(args.dataset, args.ori_env, vocab_dic[args.dataset])
             SPPC_select(args.dataset, args.ori_env, vocab_dic[args.dataset], args.threshold)
@@ -234,9 +154,15 @@ if __name__ == "__main__":
                 user_sequence = pickle.load(file3)
                 print(f"Total sequences for day {day}: {len(user_sequence)}")
 
-            combined_response = call_llm_in_batches(
-                user_sequence, sentence, device_control_dict, action_transition
-            )
+            prompt = build_prompt(sentence, device_control_dict, action_transition, user_sequence)
+            response = LLM_call(prompt)
+
+            parsed = extract_sequences_from_response(response)
+            if parsed:
+                combined_response = f"<seq {parsed} seq>"
+            else:
+                print(f"[WARNING] No valid sequences extracted for day {day}; saving raw response.")
+                combined_response = response
 
             out_path = (
                 f'IoT_data/{args.dataset}/{args.new_env}/'
@@ -244,7 +170,7 @@ if __name__ == "__main__":
             )
             with open(out_path, 'wb') as f3:
                 pickle.dump(combined_response, f3)
-            print(f"Saved merged response to {out_path}")
+            print(f"Saved response to {out_path}")
 
         Extract(args.dataset, args.new_env, args.threshold, args.method, args.model, all_categories)
         Transnum(args.dataset, args.new_env, args.threshold, args.method, args.model, all_categories, dictionaries)
@@ -252,5 +178,3 @@ if __name__ == "__main__":
 
     if args.need_test:
         Anomaly_detection(args.dataset, args.new_env, args.threshold, args.method, args.model, args.percentage)
-        # SASRec_behavior_prediction(args.dataset, args.new_env, args.threshold, args.method, args.model, need='train')
-        # SASRec_behavior_prediction(args.dataset, args.new_env, args.threshold, args.method, args.model, need='test')

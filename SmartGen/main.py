@@ -34,7 +34,7 @@ API_KEYS = [k for k in [
     os.getenv("Grok_API4"),
     os.getenv("Grok_API5"),
     os.getenv("Grok_API6"),
-    os.getenv(Grok_API7"),
+    os.getenv("Grok_API7"),
     os.getenv("Grok_API8"),
 ] if k]  # silently skip any unset keys
 
@@ -45,7 +45,7 @@ def get_client(key_index):
     """Create an OpenAI-compatible Gemini client for the given key index."""
     return OpenAI(
         api_key=API_KEYS[key_index],
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        base_url="https://api.groq.com/openai/v1",
     )
 
 
@@ -191,7 +191,7 @@ if __name__ == "__main__":
 
     if args.need_generate:
         Split(args.dataset, args.ori_env, 1)
-        Dayse(args.dataset, args.ori_env)
+        Dayse(args.dataset, args.ori_env)/
         if args.method == 'SPPC':
             Train(args.dataset, args.ori_env, vocab_dic[args.dataset])
             SPPC_select(args.dataset, args.ori_env, vocab_dic[args.dataset], args.threshold)

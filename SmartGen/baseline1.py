@@ -251,7 +251,7 @@ def evaluate(new_env, vocab_size, test_file1, test_file3, model_name, seq_len, t
 def Anomaly_detection(dataset, new_env, thres, method, model, percentage):
     model_name = f"check_model/best_{dataset}_{model}_{method}.pth"
     vocab_size = vocab_dic[dataset]
-    epochs = 15
+    epochs = 25
     seq_len = 10
     data_file = f'filter_data/{dataset}/{new_env}/{dataset}_{new_env}_generation_{method}_th={thres}_{model}_seq_filter_true.pkl'
     if new_env == 'multiple':

@@ -67,8 +67,8 @@ def LLM_call(openai_client, prompt):
         stream=False,
         messages=messages,
         max_completion_tokens=8040,
-        temperature=0,
-        top_p=0,
+       
+       
         seed=2024
     )
 
